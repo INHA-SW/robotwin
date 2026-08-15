@@ -1,0 +1,18 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Add Parameters You Need
+train_config_name: null
+model_name: null
+checkpoint_id: 30000
+# Number of actions executed from each predicted chunk. This is a control
+# horizon, not the flow sampler's denoising-step count.
+pi0_step: 50
+# Number of Euler flow-denoising steps used to generate that unchanged action
+# chunk. Keep this independent from pi0_step for few-step evaluation.
+num_inference_steps: 10

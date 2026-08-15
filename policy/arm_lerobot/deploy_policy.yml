@@ -1,0 +1,33 @@
+# ARM LeRobot policy adapter for upstream RoboTwin eval_policy_client.py.
+policy_name: arm_lerobot
+task_name: null
+task_config: demo_clean
+ckpt_setting: arm_lerobot
+seed: 0
+instruction_type: unseen
+
+# Server-side options consumed by get_model().
+policy_path: null
+device: cuda
+num_inference_steps: 10
+use_amp: false
+action_dim: 14
+robot_type: aloha-agilex
+
+# Causal real-time controller. All methods except `sync` are asynchronous;
+# simulation pauses only at the configured logical completion boundary.
+realtime_method: sync
+fixed_delay_steps: 4
+execution_horizon: 5
+refresh_after_step: 5
+realtime_seed: 0
+realtime_episode_offset: 0
+c2_rho: 0.75
+rtc_max_guidance_weight: 10.0
+realtime_events_path: null
+
+# Optional path prepended to sys.path before importing lerobot.
+lerobot_src: null
+
+# JSON mapping from RoboTwin observation keys to LeRobot checkpoint keys.
+rename_map: '{"observation.images.head_camera":"observation.images.cam_high","observation.images.left_camera":"observation.images.cam_left_wrist","observation.images.right_camera":"observation.images.cam_right_wrist"}'
