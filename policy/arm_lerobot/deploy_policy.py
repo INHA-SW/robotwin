@@ -339,7 +339,10 @@ class LeRobotPolicyAdapter:
             raise ValueError(
                 "execution_horizon must satisfy e <= prediction_horizon - d"
             )
-        if not 0 < self.refresh_after_step < self.num_inference_steps:
+        if (
+            self.realtime_method == "m1r1"
+            and not 0 < self.refresh_after_step < self.num_inference_steps
+        ):
             raise ValueError(
                 "refresh_after_step must be strictly inside the flow solve"
             )
