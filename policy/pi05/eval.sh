@@ -10,6 +10,7 @@ model_name=${4}
 seed=${5}
 gpu_id=${6}
 num_inference_steps=${NUM_INFERENCE_STEPS:-10}
+ckpt_setting=${CKPT_SETTING:-${model_name}}
 
 if ! [[ "${num_inference_steps}" =~ ^[1-9][0-9]*$ ]]; then
     echo "NUM_INFERENCE_STEPS must be a positive integer: ${num_inference_steps}" >&2
@@ -29,7 +30,7 @@ python script/eval_policy.py --config policy/$policy_name/deploy_policy.yml \
     --task_config ${task_config} \
     --train_config_name ${train_config_name} \
     --model_name ${model_name} \
-    --ckpt_setting ${model_name} \
+    --ckpt_setting ${ckpt_setting} \
     --seed ${seed} \
     --policy_name ${policy_name} \
     --num_inference_steps ${num_inference_steps}
