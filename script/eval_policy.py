@@ -1,6 +1,8 @@
 import sys
 import os
 import subprocess
+import fcntl
+import json
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -23,6 +25,85 @@ from generate_episode_instructions import *
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _append_episode_record(record):
+    output_path = os.environ.get("ROBOTWIN_EPISODE_RECORDS")
+    if not output_path:
+        return
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _load_episode_manifest(task_name, task_config, expected_count):
+    """Load exact seed/instruction rows from a prior accepted rollout ledger."""
+
+    manifest_text = os.environ.get("ROBOTWIN_EPISODE_MANIFEST", "").strip()
+    if not manifest_text:
+        return None
+    path = Path(manifest_text)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing RoboTwin episode manifest: {path}")
+
+    selected = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise ValueError(f"{path}:{line_number}: expected a JSON object")
+        if (
+            str(record.get("task")) == str(task_name)
+            and str(record.get("task_config")) == str(task_config)
+        ):
+            if record.get("included_in_denominator") is not True:
+                raise ValueError(
+                    f"{path}:{line_number}: manifest row was not in its source denominator"
+                )
+            if record.get("simulator_error") is not None:
+                raise ValueError(
+                    f"{path}:{line_number}: manifest row has a simulator error"
+                )
+            if "seed" not in record or not str(record.get("instruction", "")).strip():
+                raise ValueError(
+                    f"{path}:{line_number}: manifest row needs seed and instruction"
+                )
+            selected.append(
+                {
+                    "seed": int(record["seed"]),
+                    "instruction": str(record["instruction"]),
+                    "source_run_id": record.get("run_id"),
+                    "source_episode_uid": record.get("episode_uid"),
+                }
+            )
+
+    if len(selected) < expected_count:
+        raise ValueError(
+            f"{path}: needs at least {expected_count} rows for {task_config}/{task_name}, "
+            f"found {len(selected)}"
+        )
+    selected = selected[:expected_count]
+    seeds = [row["seed"] for row in selected]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"{path}: duplicate reset seed for {task_config}/{task_name}")
+    print(
+        f"[arm] fixed episode manifest: path={path} task={task_name} "
+        f"rows={len(selected)} seeds={seeds}",
+        flush=True,
+    )
+    return selected
 
 
 def class_decorator(task_name):
@@ -214,12 +295,24 @@ def eval_policy(task_name,
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
+    episode_manifest = _load_episode_manifest(
+        task_name,
+        args["task_config"],
+        test_num,
+    )
+    manifest_entry = None
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
-        if expert_check:
+        if episode_manifest is not None:
+            manifest_entry = episode_manifest[now_id]
+            now_seed = int(manifest_entry["seed"])
+            instruction = str(manifest_entry["instruction"])
+            succ_seed += 1
+            suc_test_seed_list.append(now_seed)
+        elif expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
@@ -233,30 +326,28 @@ def eval_policy(task_name,
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
-                # stack_trace = traceback.format_exc()
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
                 TASK_ENV.close_env()
+                args["render_freq"] = render_freq
+                print("Unexpected error during expert seed validation:", repr(e))
+                traceback.print_exc()
+                raise
+
+        if episode_manifest is None:
+            if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
+                succ_seed += 1
+                suc_test_seed_list.append(now_seed)
+            else:
                 now_seed += 1
                 args["render_freq"] = render_freq
-                print("error occurs !")
                 continue
-
-        if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
-            succ_seed += 1
-            suc_test_seed_list.append(now_seed)
-        else:
-            now_seed += 1
-            args["render_freq"] = render_freq
-            continue
 
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        if episode_manifest is None:
+            episode_info_list = [episode_info["info"]]
+            results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+            instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
@@ -305,6 +396,56 @@ def eval_policy(task_name,
             print("\033[92mSuccess!\033[0m")
         else:
             print("\033[91mFail!\033[0m")
+
+        episode_record = {
+            "schema_version": 2,
+            "record_kind": "policy_rollout",
+            "created_at": datetime.now().astimezone().isoformat(),
+            "run_id": os.environ.get("ARM_EVAL_RUN_ID"),
+            "model": os.environ.get("ARM_EVAL_MODEL", policy_name),
+            "variant": os.environ.get("ARM_EVAL_VARIANT"),
+            "benchmark": "robotwin",
+            "checkpoint_step": _env_int("ARM_EVAL_STEP", 0),
+            "task": task_name,
+            "task_config": args["task_config"],
+            "seed": int(now_seed),
+            "episode_index": int(now_id),
+            "success": bool(succ),
+            "episode_steps": int(TASK_ENV.take_action_cnt),
+            "step_limit": int(TASK_ENV.step_lim),
+            "termination_reason": "success" if succ else "step_limit",
+            "instruction": str(instruction),
+            "episode_source": (
+                "fixed_manifest" if episode_manifest is not None else "expert_filter"
+            ),
+            "manifest_path": (
+                os.environ.get("ROBOTWIN_EPISODE_MANIFEST")
+                if episode_manifest is not None
+                else None
+            ),
+            "manifest_sha256": (
+                os.environ.get("ROBOTWIN_EPISODE_MANIFEST_SHA256")
+                if episode_manifest is not None
+                else None
+            ),
+            "source_run_id": (
+                manifest_entry.get("source_run_id")
+                if episode_manifest is not None
+                else None
+            ),
+            "source_episode_uid": (
+                manifest_entry.get("source_episode_uid")
+                if episode_manifest is not None
+                else None
+            ),
+            "included_in_denominator": True,
+            "simulator_error": None,
+        }
+        episode_record["episode_uid"] = ":".join(
+            str(episode_record[key])
+            for key in ("run_id", "checkpoint_step", "task_config", "task", "seed")
+        )
+        _append_episode_record(episode_record)
 
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
