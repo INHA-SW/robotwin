@@ -51,15 +51,34 @@ def eval(TASK_ENV, model, observation):
     # ======== Get Action ========
 
     actions = model.get_action()[:model.pi0_step]
+    replan_index = int(getattr(model, "_arm_rollout_replan_index", 0))
 
-    for action in actions:
+    for chunk_action_index, action in enumerate(actions):
+        TASK_ENV._arm_replan_index = replan_index
+        TASK_ENV._arm_chunk_action_index = chunk_action_index
         TASK_ENV.take_action(action)
-        observation = TASK_ENV.get_obs()
-        input_rgb_arr, input_state = encode_obs(observation)
-        model.update_observation_window(input_rgb_arr, input_state)
+        if TASK_ENV.eval_success:
+            break
+    model._arm_rollout_replan_index = replan_index + 1
+
+    # The outer evaluator refreshes the observation immediately before the
+    # next policy call.  Reading all three RT cameras after every open-loop
+    # waypoint only overwrote this single-frame buffer with values that were
+    # never consumed, multiplying camera.get_picture calls by the chunk size.
 
     # ============================
 
 
+def probe(TASK_ENV, model, observation, *, noise_seed):
+    """Capture initial solver features without calling TASK_ENV.take_action."""
+    if model.observation_window is None:
+        model.set_language(TASK_ENV.get_instruction())
+
+    input_rgb_arr, input_state = encode_obs(observation)
+    model.update_observation_window(input_rgb_arr, input_state)
+    return model.get_solver_probe(noise_seed)
+
+
 def reset_model(model):
     model.reset_obsrvationwindows()
+    model._arm_rollout_replan_index = 0

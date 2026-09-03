@@ -16,6 +16,7 @@ from .utils import *
 import math
 from .robot import Robot
 from .camera import Camera
+from .physical_trace import PhysicalTraceRecorder
 
 from copy import deepcopy
 import subprocess
@@ -23,6 +24,7 @@ from pathlib import Path
 import trimesh
 import imageio
 import glob
+import time
 
 
 from ._GLOBAL_CONFIGS import *
@@ -31,6 +33,24 @@ from typing import Optional, Literal
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
+
+
+def _append_topp_timing(record):
+    """Append a flushed TOPP boundary record when rollout diagnostics request it."""
+    output_path = os.environ.get("ROBOTWIN_TOPP_TIMING_RECORDS", "").strip()
+    if not output_path:
+        return
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "record_kind": "robotwin_topp_timing",
+        "wall_time_unix": time.time(),
+        **record,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        handle.flush()
 
 
 class Base_Task(gym.Env):
@@ -138,6 +158,8 @@ class Base_Task(gym.Env):
             raise UnStableError(
                 f'Objects is unstable in seed({kwags.get("seed", 0)}), unstable objects: {", ".join(unstable_list)}')
 
+        self._initialize_policy_evaluation_state()
+
         if self.eval_mode:
             with open(os.path.join(CONFIGS_PATH, "_eval_step_limit.yml"), "r") as f:
                 try:
@@ -157,6 +179,25 @@ class Base_Task(gym.Env):
         self.info["info"] = {}
 
         self.stage_success_tag = False
+        self._physical_trace = PhysicalTraceRecorder.from_environment(self)
+
+    def _initialize_policy_evaluation_state(self):
+        """Restore task state that upstream initializes only in ``play_once``.
+
+        Policy evaluation does not call the expert's ``play_once`` method.  Three
+        RoboTwin 2.0 tasks nevertheless read state from ``check_success`` that is
+        assigned only there.  Derive the same values from the settled scene so
+        all manifest-driven policy rollouts use the benchmark's intended success
+        predicate instead of failing before the first motion.
+        """
+        if self.task_name == "open_laptop":
+            face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
+            self.arm_tag = ArmTag("left" if face_prod > 0 else "right")
+        elif self.task_name == "place_object_scale":
+            self.arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
+        elif self.task_name == "put_object_cabinet":
+            self.arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
+            self.origin_z = float(self.object.get_pose().p[2])
 
     def check_stable(self):
         actors_list, actors_pose_list = [], []
@@ -1485,12 +1526,20 @@ class Base_Task(gym.Env):
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
 
-        eval_video_freq = 1  # fixed
+        eval_video_freq = int(os.environ.get("ROBOTWIN_EVAL_VIDEO_FREQ", "1"))
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
             self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
+
+        if self._physical_trace is not None:
+            self._physical_trace.start_waypoint(
+                np.asarray(action),
+                action_type=action_type,
+                replan_index=int(getattr(self, "_arm_replan_index", 0)),
+                chunk_action_index=int(getattr(self, "_arm_chunk_action_index", 0)),
+            )
 
         self._update_render()
         if self.render_freq:
@@ -1544,6 +1593,16 @@ class Base_Task(gym.Env):
             # TODO
             topp_left_flag, topp_right_flag = True, True
 
+            left_topp_exception = None
+            left_topp_duration = None
+            left_topp_started = time.monotonic()
+            _append_topp_timing({
+                "event": "start",
+                "arm": "left",
+                "environment_step": int(self.take_action_cnt),
+                "path_rms": float(np.sqrt(np.mean(np.square(np.diff(left_path, axis=0))))),
+                "path_max_abs": float(np.max(np.abs(np.diff(left_path, axis=0)))),
+            })
             try:
                 times, left_pos, left_vel, acc, duration = (self.robot.left_mplib_planner.TOPP(left_path,
                                                                                             1 / 250,
@@ -1555,11 +1614,50 @@ class Base_Task(gym.Env):
                 # print("left arm TOPP error: ", e)
                 topp_left_flag = False
                 left_n_step = 50  # fixed
+                left_topp_exception = repr(e)
+                _append_topp_timing({
+                    "event": "exception",
+                    "arm": "left",
+                    "environment_step": int(self.take_action_cnt),
+                    "elapsed_seconds": float(time.monotonic() - left_topp_started),
+                    "exception": repr(e),
+                })
+            else:
+                left_topp_duration = float(duration)
+                _append_topp_timing({
+                    "event": "complete",
+                    "arm": "left",
+                    "environment_step": int(self.take_action_cnt),
+                    "elapsed_seconds": float(time.monotonic() - left_topp_started),
+                    "planner_steps": int(left_n_step),
+                    "planner_duration": float(duration),
+                })
 
             if left_n_step == 0:
                 topp_left_flag = False
                 left_n_step = 50  # fixed
 
+            if self._physical_trace is not None:
+                self._physical_trace.record_topp_plan(
+                    "left",
+                    input_path=left_path,
+                    succeeded=topp_left_flag,
+                    positions=(left_result["position"] if topp_left_flag else None),
+                    velocities=(left_result["velocity"] if topp_left_flag else None),
+                    planner_duration=left_topp_duration,
+                    exception=left_topp_exception,
+                )
+
+            right_topp_exception = None
+            right_topp_duration = None
+            right_topp_started = time.monotonic()
+            _append_topp_timing({
+                "event": "start",
+                "arm": "right",
+                "environment_step": int(self.take_action_cnt),
+                "path_rms": float(np.sqrt(np.mean(np.square(np.diff(right_path, axis=0))))),
+                "path_max_abs": float(np.max(np.abs(np.diff(right_path, axis=0)))),
+            })
             try:
                 times, right_pos, right_vel, acc, duration = (self.robot.right_mplib_planner.TOPP(right_path,
                                                                                                 1 / 250,
@@ -1571,10 +1669,39 @@ class Base_Task(gym.Env):
                 # print("right arm TOPP error: ", e)
                 topp_right_flag = False
                 right_n_step = 50  # fixed
+                right_topp_exception = repr(e)
+                _append_topp_timing({
+                    "event": "exception",
+                    "arm": "right",
+                    "environment_step": int(self.take_action_cnt),
+                    "elapsed_seconds": float(time.monotonic() - right_topp_started),
+                    "exception": repr(e),
+                })
+            else:
+                right_topp_duration = float(duration)
+                _append_topp_timing({
+                    "event": "complete",
+                    "arm": "right",
+                    "environment_step": int(self.take_action_cnt),
+                    "elapsed_seconds": float(time.monotonic() - right_topp_started),
+                    "planner_steps": int(right_n_step),
+                    "planner_duration": float(duration),
+                })
 
             if right_n_step == 0:
                 topp_right_flag = False
                 right_n_step = 50  # fixed
+
+            if self._physical_trace is not None:
+                self._physical_trace.record_topp_plan(
+                    "right",
+                    input_path=right_path,
+                    succeeded=topp_right_flag,
+                    positions=(right_result["position"] if topp_right_flag else None),
+                    velocities=(right_result["velocity"] if topp_right_flag else None),
+                    planner_duration=right_topp_duration,
+                    exception=right_topp_exception,
+                )
         
         elif action_type == 'ee':
 
@@ -1657,15 +1784,21 @@ class Base_Task(gym.Env):
                 now_right_id += 1
 
             self.scene.step()
+            if self._physical_trace is not None:
+                self._physical_trace.observe_control_step()
             self._update_render()
                 
             if self.check_success():
                 self.eval_success = True
+                if self._physical_trace is not None:
+                    self._physical_trace.end_waypoint(success=True)
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
+        if self._physical_trace is not None:
+            self._physical_trace.end_waypoint(success=False)
         self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()

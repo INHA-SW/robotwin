@@ -373,7 +373,14 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(
+        self,
+        device,
+        observation,
+        noise=None,
+        num_steps=10,
+        terminal_jump_time: float | None = None,
+    ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -398,25 +405,302 @@ class PI0Pytorch(nn.Module):
             use_cache=True,
         )
 
-        dt = -1.0 / num_steps
-        dt = torch.tensor(dt, dtype=torch.float32, device=device)
-
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
+        if terminal_jump_time is None:
+            dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+            while time >= -dt / 2:
+                expanded_time = time.expand(bsize)
+                v_t = self.denoise_step(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    expanded_time,
+                )
+                x_t = x_t + dt * v_t
+                time += dt
+        else:
+            jump_time = float(terminal_jump_time)
+            if num_steps < 2:
+                raise ValueError("terminal-jump sampling requires num_steps >= 2")
+            if not 0.0 < jump_time < 1.0:
+                raise ValueError(
+                    "terminal_jump_time must be strictly between 0 and 1, "
+                    f"got {jump_time}"
+                )
+            dense_dt = torch.tensor(
+                -(1.0 - jump_time) / (num_steps - 1),
+                dtype=torch.float32,
+                device=device,
+            )
+            jump_time_tensor = torch.tensor(
+                jump_time, dtype=torch.float32, device=device
+            )
+            while time >= jump_time_tensor - dense_dt / 2:
+                expanded_time = time.expand(bsize)
+                v_t = self.denoise_step(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    expanded_time,
+                )
+                x_t = x_t + dense_dt * v_t
+                time += dense_dt
+            time = jump_time_tensor
+            terminal_velocity = self.denoise_step(
                 state,
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
-                expanded_time,
+                time.expand(bsize),
             )
-
-            # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t + dt * v_t
-            time += dt
+            x_t = x_t - jump_time * terminal_velocity
         return x_t
+
+    @torch.no_grad()
+    def probe_solver_features(
+        self,
+        device,
+        observation,
+        noise,
+        *,
+        trace_budgets: tuple[int, ...] = (),
+    ) -> dict[str, Tensor]:
+        """Capture shared-prefix and early-flow features without producing an action rollout.
+
+        The prefix and initial velocity are common to every fixed-step Euler budget for a
+        fixed observation and noise sample.  The midpoint velocity is intentionally a
+        diagnostic-only second evaluation: it measures local flow bending but is not
+        required by the zero-discard router.
+        """
+        bsize = observation.state.shape[0]
+        if noise is None:
+            raise ValueError("probe_solver_features requires explicit fixed noise")
+        trace_budgets = tuple(dict.fromkeys(int(budget) for budget in trace_budgets))
+        if any(budget <= 0 for budget in trace_budgets):
+            raise ValueError(f"trace budgets must be positive integers: {trace_budgets}")
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        (prefix_outputs, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        initial_time = torch.ones(bsize, dtype=torch.float32, device=device)
+        v0 = self.denoise_step(
+            state,
+            prefix_pad_masks,
+            past_key_values,
+            noise,
+            initial_time,
+        )
+        midpoint_state = noise - 0.5 * v0
+        midpoint_time = torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
+        v_midpoint = self.denoise_step(
+            state,
+            prefix_pad_masks,
+            past_key_values,
+            midpoint_state,
+            midpoint_time,
+        )
+
+        prefix_weights = prefix_pad_masks.to(dtype=torch.float32).unsqueeze(-1)
+        prefix_denominator = prefix_weights.sum(dim=1).clamp_min(1.0)
+        prefix_embedding_mean = (
+            prefix_embs.to(dtype=torch.float32) * prefix_weights
+        ).sum(dim=1) / prefix_denominator
+        prefix_context_mean = (
+            prefix_outputs.to(dtype=torch.float32) * prefix_weights
+        ).sum(dim=1) / prefix_denominator
+        num_language_tokens = lang_tokens.shape[1]
+        num_image_tokens = prefix_embs.shape[1] - num_language_tokens
+        image_weights = prefix_weights[:, :num_image_tokens]
+        language_weights = prefix_weights[:, num_image_tokens:]
+        image_denominator = image_weights.sum(dim=1).clamp_min(1.0)
+        language_denominator = language_weights.sum(dim=1).clamp_min(1.0)
+        image_embedding_mean = (
+            prefix_embs[:, :num_image_tokens].to(dtype=torch.float32) * image_weights
+        ).sum(dim=1) / image_denominator
+        language_embedding_mean = (
+            prefix_embs[:, num_image_tokens:].to(dtype=torch.float32) * language_weights
+        ).sum(dim=1) / language_denominator
+        image_context_mean = (
+            prefix_outputs[:, :num_image_tokens].to(dtype=torch.float32) * image_weights
+        ).sum(dim=1) / image_denominator
+        language_context_mean = (
+            prefix_outputs[:, num_image_tokens:].to(dtype=torch.float32) * language_weights
+        ).sum(dim=1) / language_denominator
+        last_indices = prefix_pad_masks.to(dtype=torch.long).sum(dim=1).sub(1).clamp_min(0)
+        batch_indices = torch.arange(bsize, device=device)
+        prefix_context_last = prefix_outputs[batch_indices, last_indices].to(dtype=torch.float32)
+
+        flat_v0 = v0.to(dtype=torch.float32).flatten(start_dim=1)
+        flat_v_midpoint = v_midpoint.to(dtype=torch.float32).flatten(start_dim=1)
+        cosine = F.cosine_similarity(flat_v0, flat_v_midpoint, dim=1)
+        v0_norm = torch.linalg.vector_norm(flat_v0, dim=1)
+        midpoint_norm = torch.linalg.vector_norm(flat_v_midpoint, dim=1)
+        bend_norm = torch.linalg.vector_norm(flat_v_midpoint - flat_v0, dim=1)
+        relative_bend = bend_norm / v0_norm.clamp_min(1e-8)
+        scalar_features = torch.stack(
+            [v0_norm, midpoint_norm, cosine, bend_norm, relative_bend], dim=1
+        )
+
+        outputs = {
+            "state": state.to(dtype=torch.float32),
+            "noise": noise.to(dtype=torch.float32),
+            "prefix_embedding_mean": prefix_embedding_mean,
+            "prefix_context_mean": prefix_context_mean,
+            "prefix_context_last": prefix_context_last,
+            "image_embedding_mean": image_embedding_mean,
+            "language_embedding_mean": language_embedding_mean,
+            "image_context_mean": image_context_mean,
+            "language_context_mean": language_context_mean,
+            "v0": v0.to(dtype=torch.float32),
+            "midpoint_state": midpoint_state.to(dtype=torch.float32),
+            "v_midpoint": v_midpoint.to(dtype=torch.float32),
+            "scalar_features": scalar_features,
+        }
+
+        # Optional mechanism trace. Every budget starts from the same observation,
+        # prefix KV cache, and noise tensor. The first velocity is therefore shared;
+        # K=2 also reuses the exact midpoint diagnostic above. No action is executed.
+        for budget in trace_budgets:
+            dt = torch.tensor(-1.0 / budget, dtype=torch.float32, device=device)
+            x_t = noise
+            times = []
+            states_before = []
+            velocities = []
+            states_after = []
+            for step_index in range(budget):
+                time_value = 1.0 - step_index / budget
+                expanded_time = torch.full(
+                    (bsize,), time_value, dtype=torch.float32, device=device
+                )
+                if step_index == 0:
+                    velocity = v0
+                elif budget == 2 and step_index == 1:
+                    velocity = v_midpoint
+                else:
+                    velocity = self.denoise_step(
+                        state,
+                        prefix_pad_masks,
+                        past_key_values,
+                        x_t,
+                        expanded_time,
+                    )
+                next_x = x_t + dt * velocity
+                times.append(expanded_time)
+                states_before.append(x_t)
+                velocities.append(velocity)
+                states_after.append(next_x)
+                x_t = next_x
+
+            prefix = f"trace_k{budget}"
+            outputs[f"{prefix}_times"] = torch.stack(times, dim=1)
+            outputs[f"{prefix}_x_before"] = torch.stack(states_before, dim=1).to(
+                dtype=torch.float32
+            )
+            outputs[f"{prefix}_velocities"] = torch.stack(velocities, dim=1).to(
+                dtype=torch.float32
+            )
+            outputs[f"{prefix}_x_after"] = torch.stack(states_after, dim=1).to(
+                dtype=torch.float32
+            )
+            outputs[f"{prefix}_endpoint_raw"] = x_t.to(dtype=torch.float32)
+
+        return outputs
+
+    @torch.no_grad()
+    def score_candidate_flow_residuals(
+        self,
+        device,
+        observation,
+        candidates,
+        residual_noises,
+        residual_times,
+    ) -> Tensor:
+        """Score fixed raw action candidates with the frozen FM training residual.
+
+        ``candidates`` and ``residual_noises`` must stay in the normalized padded
+        model space.  The caller is responsible for pairing the same candidates,
+        noises and times across all observation/instruction conditions.
+        """
+        if observation.state.shape[0] != 1:
+            raise ValueError("candidate residual probing requires batch size 1")
+        expected_tail = (self.config.action_horizon, self.config.action_dim)
+        if tuple(candidates.shape[1:]) != expected_tail:
+            raise ValueError(
+                f"candidate shape must be (C, {expected_tail[0]}, {expected_tail[1]}), "
+                f"got {tuple(candidates.shape)}"
+            )
+        if tuple(residual_noises.shape[1:]) != expected_tail:
+            raise ValueError(
+                f"residual-noise shape must be (M, {expected_tail[0]}, {expected_tail[1]}), "
+                f"got {tuple(residual_noises.shape)}"
+            )
+        if residual_times.ndim != 1 or residual_times.numel() == 0:
+            raise ValueError("residual_times must be a non-empty 1-D tensor")
+        if torch.any(residual_times <= 0.0) or torch.any(residual_times >= 1.0):
+            raise ValueError("residual times must lie strictly inside (0, 1)")
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        squared_residuals = []
+        for candidate in candidates:
+            candidate_losses = []
+            candidate = candidate.unsqueeze(0).to(dtype=torch.float32, device=device)
+            for residual_noise in residual_noises:
+                noise_losses = []
+                residual_noise = residual_noise.unsqueeze(0).to(
+                    dtype=torch.float32, device=device
+                )
+                target_velocity = residual_noise - candidate
+                for residual_time in residual_times:
+                    time = residual_time.to(dtype=torch.float32, device=device).expand(1)
+                    time_expanded = time[:, None, None]
+                    x_t = time_expanded * residual_noise + (1.0 - time_expanded) * candidate
+                    predicted_velocity = self.denoise_step(
+                        state,
+                        prefix_pad_masks,
+                        past_key_values,
+                        x_t,
+                        time,
+                    )
+                    noise_losses.append(torch.square(predicted_velocity - target_velocity)[0])
+                candidate_losses.append(torch.stack(noise_losses, dim=0))
+            squared_residuals.append(torch.stack(candidate_losses, dim=0))
+        return torch.stack(squared_residuals, dim=0).to(dtype=torch.float32)
 
     def denoise_step(
         self,

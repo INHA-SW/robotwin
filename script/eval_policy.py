@@ -3,6 +3,7 @@ import os
 import subprocess
 import fcntl
 import json
+import faulthandler
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -45,6 +46,66 @@ def _append_episode_record(record):
         handle.write(json.dumps(record, sort_keys=True) + "\n")
         handle.flush()
         fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _write_initial_probe_artifact(
+    probe_root,
+    *,
+    task_name,
+    task_config,
+    seed,
+    episode_index,
+    instruction,
+    noise_seed,
+    features,
+):
+    root = Path(probe_root)
+    output_path = root / task_config / task_name / f"seed_{seed}_episode_{episode_index}.npz"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        raise FileExistsError(f"Initial solver probe already exists: {output_path}")
+
+    trace_budgets = np.asarray(
+        features.get("trace_budgets", np.asarray([], dtype=np.int64)),
+        dtype=np.int64,
+    )
+    ensemble_noise_seeds = np.asarray(
+        features.get("ensemble_noise_seeds", np.asarray([], dtype=np.int64)),
+        dtype=np.int64,
+    )
+    conditional_residual = "conditional_residual_sq" in features
+    schema_version = (
+        6
+        if conditional_residual
+        else (5 if ensemble_noise_seeds.size else (4 if trace_budgets.size else 3))
+    )
+    noise_contract = (
+        "fixed_solver_noise_plus_independent_paired_conditional_residual_noises"
+        if conditional_residual
+        else (
+            "consecutive_manual_seed_single_sample_traces_at_one_observation"
+            if ensemble_noise_seeds.size
+            else "first_torch_normal_after_scene_seed_reset"
+        )
+    )
+    payload = {
+        "schema_version": np.asarray(schema_version, dtype=np.int64),
+        "task": np.asarray(str(task_name)),
+        "task_config": np.asarray(str(task_config)),
+        "seed": np.asarray(int(seed), dtype=np.int64),
+        "episode_index": np.asarray(int(episode_index), dtype=np.int64),
+        "instruction": np.asarray(str(instruction)),
+        "noise_seed": np.asarray(int(noise_seed), dtype=np.int64),
+        "noise_contract": np.asarray(noise_contract),
+    }
+    for key, value in features.items():
+        payload[str(key)] = np.asarray(value)
+
+    temporary_path = output_path.with_suffix(f".{os.getpid()}.tmp")
+    with temporary_path.open("wb") as handle:
+        np.savez_compressed(handle, **payload)
+    os.replace(temporary_path, output_path)
+    return output_path
 
 
 def _load_episode_manifest(task_name, task_config, expected_count):
@@ -289,6 +350,12 @@ def eval_policy(task_name,
     policy_name = args["policy_name"]
     eval_func = eval_function_decorator(policy_name, "eval")
     reset_func = eval_function_decorator(policy_name, "reset_model")
+    initial_probe_root = os.environ.get("ROBOTWIN_INITIAL_SOLVER_PROBE_DIR", "").strip()
+    probe_func = (
+        eval_function_decorator(policy_name, "probe")
+        if initial_probe_root
+        else None
+    )
 
     now_seed = st_seed
     task_total_reward = 0
@@ -350,6 +417,115 @@ def eval_policy(task_name,
             instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
+        if initial_probe_root:
+            reset_func(model)
+            observation = TASK_ENV.get_obs()
+            noise_seed = _env_int("ROBOTWIN_PROBE_NOISE_SEED_BASE", 0) + int(now_seed)
+            features = probe_func(
+                TASK_ENV,
+                model,
+                observation,
+                noise_seed=noise_seed,
+            )
+            artifact_path = _write_initial_probe_artifact(
+                initial_probe_root,
+                task_name=task_name,
+                task_config=args["task_config"],
+                seed=now_seed,
+                episode_index=now_id,
+                instruction=instruction,
+                noise_seed=noise_seed,
+                features=features,
+            )
+            trace_budgets = np.asarray(
+                features.get("trace_budgets", np.asarray([], dtype=np.int64)),
+                dtype=np.int64,
+            ).tolist()
+            ensemble_noise_seeds = np.asarray(
+                features.get("ensemble_noise_seeds", np.asarray([], dtype=np.int64)),
+                dtype=np.int64,
+            ).tolist()
+            conditional_residual = "conditional_residual_sq" in features
+            schema_version = (
+                6
+                if conditional_residual
+                else (5 if ensemble_noise_seeds else (4 if trace_budgets else 3))
+            )
+            noise_contract = (
+                "fixed_solver_noise_plus_independent_paired_conditional_residual_noises"
+                if conditional_residual
+                else (
+                    "consecutive_manual_seed_single_sample_traces_at_one_observation"
+                    if ensemble_noise_seeds
+                    else "first_torch_normal_after_scene_seed_reset"
+                )
+            )
+            _append_episode_record(
+                {
+                    "schema_version": schema_version,
+                    "noise_contract": noise_contract,
+                    "record_kind": (
+                        "conditional_candidate_consistency_probe"
+                        if conditional_residual
+                        else (
+                            "full_solver_trace_ensemble_probe"
+                            if ensemble_noise_seeds
+                            else (
+                                "full_solver_trace_probe"
+                                if trace_budgets
+                                else "initial_solver_probe"
+                            )
+                        )
+                    ),
+                    "created_at": datetime.now().astimezone().isoformat(),
+                    "run_id": os.environ.get("ARM_EVAL_RUN_ID"),
+                    "model": os.environ.get("ARM_EVAL_MODEL", policy_name),
+                    "variant": os.environ.get("ARM_EVAL_VARIANT"),
+                    "benchmark": "robotwin",
+                    "task": task_name,
+                    "task_config": args["task_config"],
+                    "seed": int(now_seed),
+                    "episode_index": int(now_id),
+                    "instruction": str(instruction),
+                    "noise_seed": int(noise_seed),
+                    "ensemble_noise_seeds": ensemble_noise_seeds,
+                    "solver_trace_budgets": trace_budgets,
+                    "action_executed": False,
+                    "included_in_denominator": False,
+                    "termination_reason": "no_motion_probe",
+                    "artifact_path": str(artifact_path),
+                    "feature_shapes": {
+                        key: list(np.asarray(value).shape)
+                        for key, value in features.items()
+                    },
+                    "manifest_path": os.environ.get("ROBOTWIN_EPISODE_MANIFEST"),
+                    "manifest_sha256": os.environ.get(
+                        "ROBOTWIN_EPISODE_MANIFEST_SHA256"
+                    ),
+                    "source_run_id": (
+                        manifest_entry.get("source_run_id")
+                        if manifest_entry is not None
+                        else None
+                    ),
+                    "source_episode_uid": (
+                        manifest_entry.get("source_episode_uid")
+                        if manifest_entry is not None
+                        else None
+                    ),
+                }
+            )
+            now_id += 1
+            TASK_ENV.test_num += 1
+            TASK_ENV.close_env(
+                clear_cache=((succ_seed + 1) % clear_cache_freq == 0)
+            )
+            print(
+                f"[arm] no-motion initial solver probe saved: {artifact_path}",
+                flush=True,
+            )
+            now_seed += 1
+            continue
+
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
                 [
@@ -404,6 +580,28 @@ def eval_policy(task_name,
             "run_id": os.environ.get("ARM_EVAL_RUN_ID"),
             "model": os.environ.get("ARM_EVAL_MODEL", policy_name),
             "variant": os.environ.get("ARM_EVAL_VARIANT"),
+            "integration_schedule": (
+                "terminal_jump"
+                if os.environ.get("PI05_TERMINAL_JUMP_TIME", "").strip()
+                else "uniform_euler"
+            ),
+            "terminal_jump_time": (
+                float(os.environ["PI05_TERMINAL_JUMP_TIME"])
+                if os.environ.get("PI05_TERMINAL_JUMP_TIME", "").strip()
+                else None
+            ),
+            "action_intervention_mode": (
+                os.environ.get("PI05_ACTION_INTERVENTION_MODE", "").strip()
+                or None
+            ),
+            "intervention_horizons_1based": (
+                os.environ.get("PI05_INTERVENTION_HORIZONS_1BASED", "").strip()
+                or None
+            ),
+            "intervention_actions_1based": (
+                os.environ.get("PI05_INTERVENTION_ACTIONS_1BASED", "").strip()
+                or None
+            ),
             "benchmark": "robotwin",
             "checkpoint_step": _env_int("ARM_EVAL_STEP", 0),
             "task": task_name,
@@ -495,9 +693,16 @@ def parse_args_and_config():
 
 
 if __name__ == "__main__":
+    hang_trace_seconds = _env_int("ROBOTWIN_HANG_TRACE_SECONDS", 0)
+    if hang_trace_seconds > 0:
+        faulthandler.enable()
+        faulthandler.dump_traceback_later(hang_trace_seconds, repeat=True)
+
     from test_render import Sapien_TEST
     Sapien_TEST()
 
     usr_args = parse_args_and_config()
 
     main(usr_args)
+    if hang_trace_seconds > 0:
+        faulthandler.cancel_dump_traceback_later()
