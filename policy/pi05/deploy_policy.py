@@ -78,10 +78,30 @@ def eval(TASK_ENV, model, observation):
 
 def probe(TASK_ENV, model, observation, *, noise_seed):
     """Capture initial solver features without calling TASK_ENV.take_action."""
+    input_rgb_arr, input_state = encode_obs(observation)
+    if hasattr(model, "call"):
+        trace_text = os.environ.get("ROBOTWIN_SOLVER_TRACE_BUDGETS", "").strip()
+        trace_budgets = [
+            int(value)
+            for value in trace_text.replace(",", " ").split()
+        ]
+        payload = {
+            "images": {
+                "head_camera": input_rgb_arr[0],
+                "right_camera": input_rgb_arr[1],
+                "left_camera": input_rgb_arr[2],
+            },
+            "state": input_state,
+            "instruction": TASK_ENV.get_instruction(),
+            "noise_seed": int(noise_seed),
+        }
+        if trace_budgets:
+            payload["trace_budgets"] = trace_budgets
+        return model.call(func_name="probe", obs=payload)
+
     if model.observation_window is None:
         model.set_language(TASK_ENV.get_instruction())
 
-    input_rgb_arr, input_state = encode_obs(observation)
     model.update_observation_window(input_rgb_arr, input_state)
     return model.get_solver_probe(noise_seed)
 

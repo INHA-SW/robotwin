@@ -68,6 +68,52 @@ def _append_episode_record(record):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def _write_initial_probe_artifact(
+    probe_root,
+    *,
+    task_name,
+    task_config,
+    seed,
+    episode_index,
+    instruction,
+    noise_seed,
+    features,
+):
+    root = Path(probe_root)
+    output_path = (
+        root
+        / task_config
+        / task_name
+        / f"seed_{seed}_episode_{episode_index}.npz"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        raise FileExistsError(f"Initial solver probe already exists: {output_path}")
+
+    trace_budgets = np.asarray(
+        features.get("trace_budgets", np.asarray([], dtype=np.int64)),
+        dtype=np.int64,
+    )
+    payload = {
+        "schema_version": np.asarray(4 if trace_budgets.size else 3, dtype=np.int64),
+        "task": np.asarray(str(task_name)),
+        "task_config": np.asarray(str(task_config)),
+        "seed": np.asarray(int(seed), dtype=np.int64),
+        "episode_index": np.asarray(int(episode_index), dtype=np.int64),
+        "instruction": np.asarray(str(instruction)),
+        "noise_seed": np.asarray(int(noise_seed), dtype=np.int64),
+        "noise_contract": np.asarray("explicit_manual_seed_single_sample_trace"),
+    }
+    for key, value in features.items():
+        payload[str(key)] = np.asarray(value)
+
+    temporary_path = output_path.with_suffix(f".{os.getpid()}.tmp")
+    with temporary_path.open("wb") as handle:
+        np.savez_compressed(handle, **payload)
+    os.replace(temporary_path, output_path)
+    return output_path
+
+
 def _load_episode_manifest(task_name, task_config, expected_count):
     """Load exact expert-approved seed/instruction rows from a prior JSONL ledger."""
 
@@ -529,6 +575,13 @@ def eval_policy(task_name,
 
     policy_name = args["policy_name"]
     eval_func = eval_function_decorator(policy_name, "eval", conda_env=policy_conda_env)
+    reset_func = eval_function_decorator(policy_name, "reset_model", conda_env=policy_conda_env)
+    initial_probe_root = os.environ.get("ROBOTWIN_INITIAL_SOLVER_PROBE_DIR", "").strip()
+    probe_func = (
+        eval_function_decorator(policy_name, "probe", conda_env=policy_conda_env)
+        if initial_probe_root
+        else None
+    )
 
     now_seed = st_seed
     task_total_reward = 0
@@ -599,6 +652,87 @@ def eval_policy(task_name,
             results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
             instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
+
+        if initial_probe_root:
+            reset_func(model)
+            observation = TASK_ENV.get_obs()
+            noise_seed = _env_int("ROBOTWIN_PROBE_NOISE_SEED_BASE", 0) + int(now_seed)
+            features = probe_func(
+                TASK_ENV,
+                model,
+                observation,
+                noise_seed=noise_seed,
+            )
+            artifact_path = _write_initial_probe_artifact(
+                initial_probe_root,
+                task_name=task_name,
+                task_config=args["task_config"],
+                seed=now_seed,
+                episode_index=now_id,
+                instruction=instruction,
+                noise_seed=noise_seed,
+                features=features,
+            )
+            trace_budgets = np.asarray(
+                features.get("trace_budgets", np.asarray([], dtype=np.int64)),
+                dtype=np.int64,
+            ).tolist()
+            _append_episode_record(
+                {
+                    "schema_version": 4 if trace_budgets else 3,
+                    "noise_contract": "explicit_manual_seed_single_sample_trace",
+                    "record_kind": (
+                        "full_solver_trace_probe"
+                        if trace_budgets
+                        else "initial_solver_probe"
+                    ),
+                    "created_at": datetime.now().astimezone().isoformat(),
+                    "run_id": os.environ.get("ARM_EVAL_RUN_ID"),
+                    "model": os.environ.get("ARM_EVAL_MODEL", policy_name),
+                    "variant": os.environ.get("ARM_EVAL_VARIANT"),
+                    "benchmark": "robotwin",
+                    "task": task_name,
+                    "task_config": args["task_config"],
+                    "seed": int(now_seed),
+                    "episode_index": int(now_id),
+                    "instruction": str(instruction),
+                    "noise_seed": int(noise_seed),
+                    "solver_trace_budgets": trace_budgets,
+                    "action_executed": False,
+                    "included_in_denominator": False,
+                    "termination_reason": "no_motion_probe",
+                    "artifact_path": str(artifact_path),
+                    "feature_shapes": {
+                        key: list(np.asarray(value).shape)
+                        for key, value in features.items()
+                    },
+                    "manifest_path": os.environ.get("ROBOTWIN_EPISODE_MANIFEST"),
+                    "manifest_sha256": os.environ.get(
+                        "ROBOTWIN_EPISODE_MANIFEST_SHA256"
+                    ),
+                    "source_run_id": (
+                        manifest_entry.get("source_run_id")
+                        if manifest_entry is not None
+                        else None
+                    ),
+                    "source_episode_uid": (
+                        manifest_entry.get("source_episode_uid")
+                        if manifest_entry is not None
+                        else None
+                    ),
+                }
+            )
+            now_id += 1
+            TASK_ENV.test_num += 1
+            TASK_ENV.close_env(
+                clear_cache=((succ_seed + 1) % clear_cache_freq == 0)
+            )
+            print(
+                f"[arm] no-motion initial solver probe saved: {artifact_path}",
+                flush=True,
+            )
+            now_seed += 1
+            continue
 
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(

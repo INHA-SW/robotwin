@@ -437,10 +437,12 @@ class PI0:
         self.intervention_replan_index += 1
         return selected
 
-    def act(self, payload):
-        """Run one policy replan from a transport-safe observation payload."""
+    def _set_transport_observation(self, payload):
+        """Validate and install one simulator observation received over the socket."""
         if not isinstance(payload, dict):
-            raise TypeError(f"act payload must be a dict, got {type(payload).__name__}")
+            raise TypeError(
+                f"observation payload must be a dict, got {type(payload).__name__}"
+            )
         images = payload.get("images")
         state = payload.get("state")
         instruction = payload.get("instruction")
@@ -459,9 +461,50 @@ class PI0:
             [images[name] for name in required],
             np.asarray(state),
         )
+        return self.observation_window
+
+    def act(self, payload):
+        """Run one policy replan from a transport-safe observation payload."""
+        self._set_transport_observation(payload)
         actions = np.asarray(self.get_action()[: self.pi0_step], dtype=np.float32)
         self._arm_rollout_replan_index += 1
         return actions
+
+    def probe(self, payload):
+        """Capture matched-NFE traces for one transported observation without motion."""
+        observation = self._set_transport_observation(payload)
+        if "noise_seed" not in payload:
+            raise ValueError("probe payload requires an explicit noise_seed")
+        budgets = tuple(
+            dict.fromkeys(
+                int(value)
+                for value in payload.get("trace_budgets", self.matched_budgets)
+            )
+        )
+        if not budgets or any(budget <= 0 for budget in budgets):
+            raise ValueError(f"probe trace_budgets must be positive: {budgets}")
+
+        features = self.policy.probe_solver_features(
+            observation,
+            noise_seed=int(payload["noise_seed"]),
+            trace_budgets=budgets,
+        )
+        features.update(
+            {
+                "observation_state": np.asarray(observation["state"]),
+                "observation_cam_high": np.asarray(
+                    observation["images"]["cam_high"]
+                ),
+                "observation_cam_left_wrist": np.asarray(
+                    observation["images"]["cam_left_wrist"]
+                ),
+                "observation_cam_right_wrist": np.asarray(
+                    observation["images"]["cam_right_wrist"]
+                ),
+                "instruction": str(observation["prompt"]),
+            }
+        )
+        return features
 
     def health(self):
         """Return the loaded policy contract for local transport preflights."""
