@@ -45,8 +45,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
 
 # The public RoboTwin PyTorch checkpoint checks for the Motus transformers
-# replacement at model construction time.
+# replacement at model construction time. Its runtime model module also imports
+# pytest.Cache in a type annotation, even though pytest is in the dev group.
 RUN uv pip install --python $UV_PROJECT_ENVIRONMENT/bin/python --no-cache \
+    "pytest==8.3.4" \
     "transformers==4.53.2"
 COPY src/openpi/models_pytorch/transformers_replace/ /tmp/transformers_replace/
 RUN transformers_dir="$($UV_PROJECT_ENVIRONMENT/bin/python -c \
