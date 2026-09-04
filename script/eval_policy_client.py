@@ -330,6 +330,12 @@ class ModelClient:
 
     def call(self, func_name=None, obs=None):
         response = self._send_recv({"cmd": func_name, "obs": obs})
+        if "error" in response:
+            raise RuntimeError(f"Model server error during {func_name}: {response['error']}")
+        if "res" not in response:
+            raise RuntimeError(
+                f"Malformed model server response during {func_name}: {response}"
+            )
         return response['res']
 
     def close(self):
@@ -610,7 +616,13 @@ def eval_policy(task_name,
 
         succ = False
         _debug("reset_model start")
-        model.call(func_name='reset_model')
+        reset_context = {
+            "episode_seed": int(now_seed),
+            "task_name": str(task_name),
+            "task_config": str(args["task_config"]),
+            "episode_index": int(now_id),
+        }
+        model.call(func_name="reset_model", obs=reset_context)
         _debug("reset_model done")
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
             _debug(f"loop step={TASK_ENV.take_action_cnt} get_obs start")
