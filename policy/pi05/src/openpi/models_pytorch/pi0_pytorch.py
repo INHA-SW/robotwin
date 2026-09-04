@@ -467,6 +467,7 @@ class PI0Pytorch(nn.Module):
         noise,
         *,
         trace_budgets: tuple[int, ...] = (),
+        include_diagnostics: bool = True,
     ) -> dict[str, Tensor]:
         """Capture shared-prefix and early-flow features without producing an action rollout.
 
@@ -509,72 +510,84 @@ class PI0Pytorch(nn.Module):
             noise,
             initial_time,
         )
-        midpoint_state = noise - 0.5 * v0
-        midpoint_time = torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
-        v_midpoint = self.denoise_step(
-            state,
-            prefix_pad_masks,
-            past_key_values,
-            midpoint_state,
-            midpoint_time,
-        )
-
-        prefix_weights = prefix_pad_masks.to(dtype=torch.float32).unsqueeze(-1)
-        prefix_denominator = prefix_weights.sum(dim=1).clamp_min(1.0)
-        prefix_embedding_mean = (
-            prefix_embs.to(dtype=torch.float32) * prefix_weights
-        ).sum(dim=1) / prefix_denominator
-        prefix_context_mean = (
-            prefix_outputs.to(dtype=torch.float32) * prefix_weights
-        ).sum(dim=1) / prefix_denominator
-        num_language_tokens = lang_tokens.shape[1]
-        num_image_tokens = prefix_embs.shape[1] - num_language_tokens
-        image_weights = prefix_weights[:, :num_image_tokens]
-        language_weights = prefix_weights[:, num_image_tokens:]
-        image_denominator = image_weights.sum(dim=1).clamp_min(1.0)
-        language_denominator = language_weights.sum(dim=1).clamp_min(1.0)
-        image_embedding_mean = (
-            prefix_embs[:, :num_image_tokens].to(dtype=torch.float32) * image_weights
-        ).sum(dim=1) / image_denominator
-        language_embedding_mean = (
-            prefix_embs[:, num_image_tokens:].to(dtype=torch.float32) * language_weights
-        ).sum(dim=1) / language_denominator
-        image_context_mean = (
-            prefix_outputs[:, :num_image_tokens].to(dtype=torch.float32) * image_weights
-        ).sum(dim=1) / image_denominator
-        language_context_mean = (
-            prefix_outputs[:, num_image_tokens:].to(dtype=torch.float32) * language_weights
-        ).sum(dim=1) / language_denominator
-        last_indices = prefix_pad_masks.to(dtype=torch.long).sum(dim=1).sub(1).clamp_min(0)
-        batch_indices = torch.arange(bsize, device=device)
-        prefix_context_last = prefix_outputs[batch_indices, last_indices].to(dtype=torch.float32)
-
-        flat_v0 = v0.to(dtype=torch.float32).flatten(start_dim=1)
-        flat_v_midpoint = v_midpoint.to(dtype=torch.float32).flatten(start_dim=1)
-        cosine = F.cosine_similarity(flat_v0, flat_v_midpoint, dim=1)
-        v0_norm = torch.linalg.vector_norm(flat_v0, dim=1)
-        midpoint_norm = torch.linalg.vector_norm(flat_v_midpoint, dim=1)
-        bend_norm = torch.linalg.vector_norm(flat_v_midpoint - flat_v0, dim=1)
-        relative_bend = bend_norm / v0_norm.clamp_min(1e-8)
-        scalar_features = torch.stack(
-            [v0_norm, midpoint_norm, cosine, bend_norm, relative_bend], dim=1
-        )
-
         outputs = {
             "state": state.to(dtype=torch.float32),
             "noise": noise.to(dtype=torch.float32),
-            "prefix_embedding_mean": prefix_embedding_mean,
-            "prefix_context_mean": prefix_context_mean,
-            "prefix_context_last": prefix_context_last,
-            "image_embedding_mean": image_embedding_mean,
-            "language_embedding_mean": language_embedding_mean,
-            "image_context_mean": image_context_mean,
-            "language_context_mean": language_context_mean,
             "v0": v0.to(dtype=torch.float32),
-            "midpoint_state": midpoint_state.to(dtype=torch.float32),
-            "v_midpoint": v_midpoint.to(dtype=torch.float32),
-            "scalar_features": scalar_features,
         }
+        v_midpoint = None
+        if include_diagnostics:
+            midpoint_state = noise - 0.5 * v0
+            midpoint_time = torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
+            v_midpoint = self.denoise_step(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                midpoint_state,
+                midpoint_time,
+            )
+            prefix_weights = prefix_pad_masks.to(dtype=torch.float32).unsqueeze(-1)
+            prefix_denominator = prefix_weights.sum(dim=1).clamp_min(1.0)
+            num_language_tokens = lang_tokens.shape[1]
+            num_image_tokens = prefix_embs.shape[1] - num_language_tokens
+            image_weights = prefix_weights[:, :num_image_tokens]
+            language_weights = prefix_weights[:, num_image_tokens:]
+            image_denominator = image_weights.sum(dim=1).clamp_min(1.0)
+            language_denominator = language_weights.sum(dim=1).clamp_min(1.0)
+            last_indices = prefix_pad_masks.to(dtype=torch.long).sum(dim=1).sub(1).clamp_min(0)
+            batch_indices = torch.arange(bsize, device=device)
+            flat_v0 = v0.to(dtype=torch.float32).flatten(start_dim=1)
+            flat_v_midpoint = v_midpoint.to(dtype=torch.float32).flatten(start_dim=1)
+            v0_norm = torch.linalg.vector_norm(flat_v0, dim=1)
+            midpoint_norm = torch.linalg.vector_norm(flat_v_midpoint, dim=1)
+            bend_norm = torch.linalg.vector_norm(flat_v_midpoint - flat_v0, dim=1)
+            outputs.update(
+                {
+                    "prefix_embedding_mean": (
+                        prefix_embs.to(dtype=torch.float32) * prefix_weights
+                    ).sum(dim=1)
+                    / prefix_denominator,
+                    "prefix_context_mean": (
+                        prefix_outputs.to(dtype=torch.float32) * prefix_weights
+                    ).sum(dim=1)
+                    / prefix_denominator,
+                    "prefix_context_last": prefix_outputs[
+                        batch_indices, last_indices
+                    ].to(dtype=torch.float32),
+                    "image_embedding_mean": (
+                        prefix_embs[:, :num_image_tokens].to(dtype=torch.float32)
+                        * image_weights
+                    ).sum(dim=1)
+                    / image_denominator,
+                    "language_embedding_mean": (
+                        prefix_embs[:, num_image_tokens:].to(dtype=torch.float32)
+                        * language_weights
+                    ).sum(dim=1)
+                    / language_denominator,
+                    "image_context_mean": (
+                        prefix_outputs[:, :num_image_tokens].to(dtype=torch.float32)
+                        * image_weights
+                    ).sum(dim=1)
+                    / image_denominator,
+                    "language_context_mean": (
+                        prefix_outputs[:, num_image_tokens:].to(dtype=torch.float32)
+                        * language_weights
+                    ).sum(dim=1)
+                    / language_denominator,
+                    "midpoint_state": midpoint_state.to(dtype=torch.float32),
+                    "v_midpoint": v_midpoint.to(dtype=torch.float32),
+                    "scalar_features": torch.stack(
+                        [
+                            v0_norm,
+                            midpoint_norm,
+                            F.cosine_similarity(flat_v0, flat_v_midpoint, dim=1),
+                            bend_norm,
+                            bend_norm / v0_norm.clamp_min(1e-8),
+                        ],
+                        dim=1,
+                    ),
+                }
+            )
 
         # Optional mechanism trace. Every budget starts from the same observation,
         # prefix KV cache, and noise tensor. The first velocity is therefore shared;
@@ -593,7 +606,7 @@ class PI0Pytorch(nn.Module):
                 )
                 if step_index == 0:
                     velocity = v0
-                elif budget == 2 and step_index == 1:
+                elif budget == 2 and step_index == 1 and v_midpoint is not None:
                     velocity = v_midpoint
                 else:
                     velocity = self.denoise_step(

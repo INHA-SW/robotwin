@@ -6,8 +6,11 @@
 import json
 import sys
 import hashlib
+from pathlib import Path
+import re
 import jax
 import numpy as np
+import torch
 from openpi.models import model as _model
 from openpi.policies import aloha_policy
 from openpi.policies import policy_config as _policy_config
@@ -157,6 +160,15 @@ class PI0:
         self.inference_timing_records = os.environ.get(
             "PI05_INFERENCE_TIMING_RECORDS", ""
         ).strip()
+        self.matched_budget_trace_path = os.environ.get(
+            "PI05_MATCHED_BUDGET_TRACE_PATH", ""
+        ).strip()
+        self.rollout_record_root = os.environ.get(
+            "PI05_ROLLOUT_RECORD_ROOT", ""
+        ).strip()
+        self._default_intervention_records = self.intervention_records
+        self._default_inference_timing_records = self.inference_timing_records
+        self._default_matched_budget_trace_path = self.matched_budget_trace_path
         self.intervention_replan_index = 0
         terminal_jump_text = os.environ.get("PI05_TERMINAL_JUMP_TIME", "").strip()
         self.terminal_jump_time = (
@@ -273,6 +285,7 @@ class PI0:
                 self.observation_window,
                 budgets=(control_budget,),
                 include_diagnostics=False,
+                trace_path=self.matched_budget_trace_path or None,
             )[control_budget]
             self._append_inference_timing(
                 phase="selected_budget_only",
@@ -287,6 +300,7 @@ class PI0:
         actions_by_budget = self.policy.infer_action_budgets(
             self.observation_window,
             budgets=self.matched_budgets,
+            trace_path=self.matched_budget_trace_path or None,
         )
         inference_wall_seconds = time.monotonic() - inference_started
         candidates = {
@@ -385,6 +399,7 @@ class PI0:
                 "left_j1..j6,left_gripper,right_j1..j6,right_gripper"
             ),
             "candidate_budgets": list(self.matched_budgets),
+            "episode_context": self._episode_context,
             "k2_k10_rms": float(np.sqrt(np.mean(np.square(delta)))),
             "masked_k2_k10_rms": float(
                 np.sqrt(np.mean(np.square(masked_delta)))
@@ -518,16 +533,69 @@ class PI0:
             "action_execution_steps": self.pi0_step,
             "num_inference_steps": self.num_inference_steps,
             "matched_budgets": list(self.matched_budgets),
+            "action_intervention_mode": self.action_intervention_mode or None,
+            "first_replan_matched_only": self.first_replan_matched_only,
+            "rollout_record_root": self.rollout_record_root or None,
         }
 
     def reset_model(self, episode_context=None):
         """Reset recurrent state while retaining paired episode metadata."""
         self.reset_obsrvationwindows()
         self._arm_rollout_replan_index = 0
+        self.intervention_replan_index = 0
         self._episode_context = episode_context
+        self.intervention_records = self._default_intervention_records
+        self.inference_timing_records = self._default_inference_timing_records
+        self.matched_budget_trace_path = self._default_matched_budget_trace_path
+        episode_record_root = None
+        if self.rollout_record_root:
+            if not isinstance(episode_context, dict):
+                raise ValueError(
+                    "PI05_ROLLOUT_RECORD_ROOT requires an episode context mapping"
+                )
+
+            def safe_component(name):
+                value = str(episode_context.get(name, ""))
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+                    raise ValueError(f"unsafe or missing episode context {name}: {value!r}")
+                return value
+
+            task_name = safe_component("task_name")
+            task_config = safe_component("task_config")
+            episode_seed = int(episode_context["episode_seed"])
+            episode_index = int(episode_context["episode_index"])
+            episode_record_root = (
+                Path(self.rollout_record_root)
+                / task_config
+                / task_name
+                / f"seed_{episode_seed}_episode_{episode_index}"
+            )
+            episode_record_root.mkdir(parents=True, exist_ok=False)
+            self.intervention_records = str(
+                episode_record_root / "intervention.jsonl"
+            )
+            self.inference_timing_records = str(
+                episode_record_root / "inference_timing.jsonl"
+            )
+            self.matched_budget_trace_path = str(
+                episode_record_root / "first_matched_trace.npz"
+            )
+            context_path = episode_record_root / "episode_context.json"
+            temporary = context_path.with_suffix(f".{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(episode_context, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, context_path)
+
+        if isinstance(episode_context, dict) and "episode_seed" in episode_context:
+            torch.manual_seed(int(episode_context["episode_seed"]))
         return {
             "reset": True,
             "episode_context": episode_context,
+            "episode_record_root": (
+                str(episode_record_root) if episode_record_root is not None else None
+            ),
         }
 
     def _append_inference_timing(
@@ -564,6 +632,7 @@ class PI0:
             "diagnostics_enabled": diagnostics_enabled,
             "nominal_nfe_sum": int(sum(computed_budgets)),
             "actual_field_evaluations": int(field_evaluations),
+            "episode_context": self._episode_context,
         }
         with open(self.inference_timing_records, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")

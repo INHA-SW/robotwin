@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 import hashlib
 import logging
+import os
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -336,6 +337,8 @@ class Policy(BasePolicy):
         obs: dict,
         *,
         budgets: tuple[int, ...],
+        include_diagnostics: bool = True,
+        trace_path: str | pathlib.Path | None = None,
     ) -> dict[int, np.ndarray]:
         """Sample matched-noise action endpoints for several Euler budgets.
 
@@ -368,6 +371,7 @@ class Policy(BasePolicy):
             observation,
             noise,
             trace_budgets=budgets,
+            include_diagnostics=include_diagnostics,
         )
 
         state = np.asarray(inputs["state"][0, ...].detach().cpu())
@@ -383,6 +387,42 @@ class Policy(BasePolicy):
                 }
             )
             actions_by_budget[budget] = np.asarray(transformed["actions"])
+
+        # Persist the exact first matched-noise candidates used by a rollout.
+        # Later selected-budget-only replans keep this artifact immutable.
+        trace_path_text = str(
+            trace_path
+            if trace_path is not None
+            else os.environ.get("PI05_MATCHED_BUDGET_TRACE_PATH", "")
+        ).strip()
+        if trace_path_text:
+            trace_path = pathlib.Path(trace_path_text)
+            if not trace_path.exists():
+                if not include_diagnostics:
+                    raise ValueError(
+                        "the first matched-budget call must include diagnostics"
+                    )
+                trace_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "schema_version": np.asarray(1, dtype=np.int64),
+                    "trace_budgets": np.asarray(budgets, dtype=np.int64),
+                    "instruction": np.asarray(str(obs.get("prompt", ""))),
+                    "observation_state": np.asarray(obs["state"]),
+                }
+                for image_name, image in obs.get("images", {}).items():
+                    payload[f"observation_{image_name}"] = np.asarray(image)
+                payload.update(
+                    {
+                        key: np.asarray(value[0, ...].detach().cpu())
+                        for key, value in outputs.items()
+                    }
+                )
+                for budget, actions in actions_by_budget.items():
+                    payload[f"trace_k{budget}_actions"] = np.asarray(actions)
+                temporary = trace_path.with_suffix(f".{os.getpid()}.tmp")
+                with temporary.open("wb") as handle:
+                    np.savez_compressed(handle, **payload)
+                os.replace(temporary, trace_path)
         return actions_by_budget
 
     @property
