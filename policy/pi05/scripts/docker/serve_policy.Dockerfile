@@ -22,6 +22,7 @@ WORKDIR /app
 # which compiles its extension against the kernel input headers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    clang \
     git \
     git-lfs \
     linux-libc-dev \
