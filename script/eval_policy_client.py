@@ -362,7 +362,8 @@ class ModelClient:
 
 
 def main(usr_args):
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    time_format = "%Y-%m-%d_%H-%M-%S" if os.name == "nt" else "%Y-%m-%d %H:%M:%S"
+    current_time = datetime.now().strftime(time_format)
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
     ckpt_setting = usr_args["ckpt_setting"]
