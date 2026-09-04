@@ -1,27 +1,23 @@
-import sys
-import os
-import subprocess
 import socket
 import json
 import threading
 import time
-import random
 import traceback
 import yaml
-from datetime import datetime
 import importlib
 import argparse
-from pathlib import Path
-from collections import deque
-
-sys.path.append("./")
-sys.path.append(f"./policy")
-sys.path.append("./description/utils")
-from envs._GLOBAL_CONFIGS import CONFIGS_PATH
+import os
+import sys
 
 import numpy as np
 from typing import Any
 import base64
+
+
+ROBOTWIN_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+for module_root in (ROBOTWIN_ROOT, os.path.join(ROBOTWIN_ROOT, "policy")):
+    if module_root not in sys.path:
+        sys.path.insert(0, module_root)
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -72,7 +68,7 @@ def json_to_numpy(json_str: str) -> Any:
 
 # --------------------- Model Server Implementation ---------------------
 class ModelServer:
-    def __init__(self, model, host='localhost', port=None):
+    def __init__(self, model, host='127.0.0.1', port=None):
         self.model = model
         self.host = host
         self.port = port
@@ -84,6 +80,7 @@ class ModelServer:
     def start(self):
         """Start the model server and listen for incoming client connections"""
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.settimeout(self.wait_interval)
         self.server_socket.listen(5)
@@ -181,44 +178,17 @@ class ModelServer:
                     break
 
 
-# --------------------- Utility Decorators ---------------------
-def class_decorator(task_name):
-    """Instantiate environment class for given task"""
-    envs_module = importlib.import_module(f"envs.{task_name}")
-    if not hasattr(envs_module, task_name):
-        raise SystemExit("Task not found")
-    return getattr(envs_module, task_name)()
-
-
 def eval_function_decorator(policy_name, model_name, conda_env=None):
     """Load a specified function (e.g., get_model) from a policy module"""
     module = importlib.import_module(policy_name)
     return getattr(module, model_name)
 
 
-def get_camera_config(camera_type):
-    """Load camera configuration from YAML file"""
-    cfg_path = os.path.join(os.path.dirname(__file__), "../task_config/_camera_config.yml")
-    if not os.path.isfile(cfg_path):
-        raise FileNotFoundError("Camera config file not found")
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
-    if camera_type not in cfg:
-        raise KeyError(f"Camera type '{camera_type}' is not defined")
-    return cfg[camera_type]
-
-
-def get_embodiment_config(robot_file):
-    """Load robot embodiment configuration from YAML"""
-    path = os.path.join(robot_file, "config.yml")
-    with open(path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
-
-
 def main(usr_args):
     """Main entry: load model, start server, run indefinitely"""
     # Extract basic arguments
     policy_name = usr_args['policy_name']
+    host = usr_args.get('host', '127.0.0.1')
     port = usr_args.get('port')
 
     # Instantiate model
@@ -226,7 +196,7 @@ def main(usr_args):
     model = get_model(usr_args)
 
     # Start server in background thread
-    server = ModelServer(model, port=port)
+    server = ModelServer(model, host=host, port=port)
     thread = threading.Thread(target=server.start, daemon=True)
     thread.start()
 
@@ -243,6 +213,11 @@ def main(usr_args):
 def parse_args_and_config():
     """Parse CLI args and YAML config, merge overrides"""
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--host',
+        default='127.0.0.1',
+        help='Listen address. Use 0.0.0.0 only behind an explicit container port mapping.',
+    )
     parser.add_argument('--port', type=int, help='Port for ModelServer (optional)')
     parser.add_argument('--config', type=str, required=True, help='Path to config YAML')
     parser.add_argument('--overrides', nargs=argparse.REMAINDER,
@@ -252,6 +227,7 @@ def parse_args_and_config():
     # Load base config
     with open(args.config, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
+    cfg['host'] = args.host
     cfg['port'] = args.port
 
     # Parse overrides: --key value pairs

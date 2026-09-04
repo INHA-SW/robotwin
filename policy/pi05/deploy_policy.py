@@ -1,13 +1,9 @@
 import numpy as np
-import torch
-import dill
 import os, sys
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 sys.path.append(parent_directory)
-
-from pi_model import *
 
 
 # Encode observation for the model
@@ -23,6 +19,8 @@ def encode_obs(observation):
 
 
 def get_model(usr_args):
+    from pi_model import PI0
+
     train_config_name, model_name, checkpoint_id, pi0_step, num_inference_steps = (
         usr_args["train_config_name"],
         usr_args["model_name"],
@@ -40,17 +38,26 @@ def get_model(usr_args):
 
 
 def eval(TASK_ENV, model, observation):
+    instruction = TASK_ENV.get_instruction()
+    if hasattr(model, "call"):
+        input_rgb_arr, input_state = encode_obs(observation)
+        payload = {
+            "images": {
+                "head_camera": input_rgb_arr[0],
+                "right_camera": input_rgb_arr[1],
+                "left_camera": input_rgb_arr[2],
+            },
+            "state": input_state,
+            "instruction": instruction,
+        }
+        actions = np.asarray(model.call(func_name="act", obs=payload))
+    else:
+        if model.observation_window is None:
+            model.set_language(instruction)
+        input_rgb_arr, input_state = encode_obs(observation)
+        model.update_observation_window(input_rgb_arr, input_state)
+        actions = model.get_action()[:model.pi0_step]
 
-    if model.observation_window is None:
-        instruction = TASK_ENV.get_instruction()
-        model.set_language(instruction)
-
-    input_rgb_arr, input_state = encode_obs(observation)
-    model.update_observation_window(input_rgb_arr, input_state)
-
-    # ======== Get Action ========
-
-    actions = model.get_action()[:model.pi0_step]
     replan_index = int(getattr(model, "_arm_rollout_replan_index", 0))
 
     for chunk_action_index, action in enumerate(actions):
@@ -80,5 +87,6 @@ def probe(TASK_ENV, model, observation, *, noise_seed):
 
 
 def reset_model(model):
-    model.reset_obsrvationwindows()
-    model._arm_rollout_replan_index = 0
+    if hasattr(model, "call"):
+        return model.call(func_name="reset_model")
+    return model.reset_model()

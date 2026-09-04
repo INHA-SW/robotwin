@@ -3,8 +3,13 @@
 This repository was recovered on 2026-08-15 from the server2 deployment at
 `/data/seongwoong/git_repo/arm/benchmarks/robotwin`.
 
-- The server2 deployment did not contain Git metadata, so its exact upstream
-  base commit is unknown.
+- The recovered host overlay did not contain Git metadata. A later read-only
+  inspection of the validated `arm-openpi-robotwin-trace:20260827` image found
+  a clean `/opt/robotwin` checkout at upstream commit
+  `0aeea2d669c0f8516f4d5785f0aa33ba812c14b4`. The image identity was
+  `sha256:91458c838a893561c5856ed78e389afe4f261b72f64a8172f66008f61d494b3e`.
+  Treat that pair as the reproducible base for the current server2/Home
+  deployment, not as proof that every older recovered run used the same base.
 - Only executable source under `envs/`, `policy/`, and `script/` is preserved
   here. The 16 GB `assets/` tree remains a host-local runtime asset and is not
   part of this repository.

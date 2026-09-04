@@ -5,7 +5,10 @@ import json
 import faulthandler
 import signal
 import time
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; Home uses one evaluator per ledger.
+    fcntl = None
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -57,10 +60,12 @@ def _append_episode_record(record):
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_EX)
         handle.write(json.dumps(record, sort_keys=True) + "\n")
         handle.flush()
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def _load_episode_manifest(task_name, task_config, expected_count):
@@ -623,6 +628,7 @@ def eval_policy(task_name,
             "episode_index": int(now_id),
         }
         model.call(func_name="reset_model", obs=reset_context)
+        model._arm_rollout_replan_index = 0
         _debug("reset_model done")
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
             _debug(f"loop step={TASK_ENV.take_action_cnt} get_obs start")

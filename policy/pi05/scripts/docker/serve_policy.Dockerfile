@@ -10,6 +10,12 @@
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04@sha256:2d913b09e6be8387e1a10976933642c73c840c0b735f0bf3c28d97fc9bc422e0
 COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 
+ARG ARM_ROOT_REVISION=unknown
+ARG ROBOTWIN_OVERLAY_REVISION=unknown
+LABEL org.opencontainers.image.revision="${ARM_ROOT_REVISION}" \
+      arm.robotwin.overlay.revision="${ROBOTWIN_OVERLAY_REVISION}" \
+      arm.runtime.role="home-pi05-model-server"
+
 WORKDIR /app
 
 # Needed because LeRobot uses git-lfs.
@@ -30,5 +36,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=packages/openpi-client/pyproject.toml,target=packages/openpi-client/pyproject.toml \
     --mount=type=bind,source=packages/openpi-client/src,target=packages/openpi-client/src \
     GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
+
+# The public RoboTwin PyTorch checkpoint checks for the Motus transformers
+# replacement at model construction time.
+RUN uv pip install --python $UV_PROJECT_ENVIRONMENT/bin/python --no-cache \
+    "transformers==4.53.2"
+COPY src/openpi/models_pytorch/transformers_replace/ /tmp/transformers_replace/
+RUN transformers_dir="$($UV_PROJECT_ENVIRONMENT/bin/python -c \
+      'import pathlib, transformers; print(pathlib.Path(transformers.__file__).parent)')" \
+    && cp -R /tmp/transformers_replace/. "$transformers_dir/" \
+    && rm -rf /tmp/transformers_replace
 
 CMD /bin/bash -c "uv run scripts/serve_policy.py $SERVER_ARGS"

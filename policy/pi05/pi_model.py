@@ -177,8 +177,24 @@ class PI0:
                     f"got {self.terminal_jump_time}"
                 )
 
-        specified_path = f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}/assets/"
+        default_checkpoint_dir = os.path.join(
+            "policy",
+            "pi05",
+            "checkpoints",
+            self.train_config_name,
+            self.model_name,
+            str(self.checkpoint_id),
+        )
+        self.checkpoint_dir = os.path.abspath(
+            os.environ.get("PI05_CHECKPOINT_DIR", default_checkpoint_dir)
+        )
+        specified_path = os.path.join(self.checkpoint_dir, "assets")
         entries = os.listdir(specified_path)
+        if len(entries) != 1:
+            raise ValueError(
+                f"Expected exactly one normalization asset under {specified_path}, "
+                f"found {entries}"
+            )
         assets_id = entries[0]
 
         config = _config.get_config(self.train_config_name)
@@ -187,7 +203,7 @@ class PI0:
             sample_kwargs["terminal_jump_time"] = self.terminal_jump_time
         self.policy = _policy_config.create_trained_policy(
             config,
-            f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}",
+            self.checkpoint_dir,
             robotwin_repo_id=assets_id,
             sample_kwargs=sample_kwargs,
             )
@@ -202,6 +218,8 @@ class PI0:
         )
         self.img_size = (224, 224)
         self.observation_window = None
+        self._arm_rollout_replan_index = 0
+        self._episode_context = None
 
     # set img_size
     def set_img_size(self, img_size):
@@ -418,6 +436,56 @@ class PI0:
         )
         self.intervention_replan_index += 1
         return selected
+
+    def act(self, payload):
+        """Run one policy replan from a transport-safe observation payload."""
+        if not isinstance(payload, dict):
+            raise TypeError(f"act payload must be a dict, got {type(payload).__name__}")
+        images = payload.get("images")
+        state = payload.get("state")
+        instruction = payload.get("instruction")
+        if not isinstance(images, dict):
+            raise ValueError("act payload requires an images mapping")
+        required = ("head_camera", "right_camera", "left_camera")
+        missing = [name for name in required if name not in images]
+        if missing:
+            raise ValueError(f"act payload is missing images: {missing}")
+        if state is None or not str(instruction or "").strip():
+            raise ValueError("act payload requires state and non-empty instruction")
+
+        if self.observation_window is None or instruction != self.instruction:
+            self.set_language(str(instruction))
+        self.update_observation_window(
+            [images[name] for name in required],
+            np.asarray(state),
+        )
+        actions = np.asarray(self.get_action()[: self.pi0_step], dtype=np.float32)
+        self._arm_rollout_replan_index += 1
+        return actions
+
+    def health(self):
+        """Return the loaded policy contract for local transport preflights."""
+        return {
+            "schema_version": 1,
+            "status": "ready",
+            "train_config_name": self.train_config_name,
+            "model_name": self.model_name,
+            "checkpoint_id": self.checkpoint_id,
+            "checkpoint_dir": self.checkpoint_dir,
+            "action_execution_steps": self.pi0_step,
+            "num_inference_steps": self.num_inference_steps,
+            "matched_budgets": list(self.matched_budgets),
+        }
+
+    def reset_model(self, episode_context=None):
+        """Reset recurrent state while retaining paired episode metadata."""
+        self.reset_obsrvationwindows()
+        self._arm_rollout_replan_index = 0
+        self._episode_context = episode_context
+        return {
+            "reset": True,
+            "episode_context": episode_context,
+        }
 
     def _append_inference_timing(
         self,
