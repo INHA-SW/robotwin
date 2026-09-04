@@ -27,6 +27,7 @@ class Robot:
 
         self.left_js = None
         self.right_js = None
+        self.need_plan = kwargs.get("need_plan", True)
 
         left_embodiment_args = kwargs["left_embodiment_config"]
         right_embodiment_args = kwargs["right_embodiment_config"]
@@ -122,7 +123,7 @@ class Robot:
     def reset(self, scene, need_topp=False, **kwargs):
         self._init_robot_(scene, need_topp, **kwargs)
 
-        if not kwargs.get("need_plan", True):
+        if not self.need_plan:
             self.init_joints()
             return
 
@@ -344,7 +345,19 @@ class Robot:
         gripper_pose_quat = t3d.quaternions.mat2quat(gripper_pose_mat)
         return sapien.Pose(gripper_pose_pos, gripper_pose_quat)
 
+    @staticmethod
+    def _interpolate_gripper(now_val, target_val):
+        """Match the planners' pure NumPy gripper interpolation contract."""
+        num_step = 200
+        return {
+            "num_step": num_step,
+            "per_step": (target_val - now_val) / num_step,
+            "result": np.linspace(now_val, target_val, num_step),
+        }
+
     def left_plan_grippers(self, now_val, target_val):
+        if not self.need_plan:
+            return self._interpolate_gripper(now_val, target_val)
         if self.communication_flag:
             self.left_conn.send({"cmd": "plan_grippers", "now_val": now_val, "target_val": target_val})
             return self.left_conn.recv()
@@ -352,6 +365,8 @@ class Robot:
             return self.left_planner.plan_grippers(now_val, target_val)
 
     def right_plan_grippers(self, now_val, target_val):
+        if not self.need_plan:
+            return self._interpolate_gripper(now_val, target_val)
         if self.communication_flag:
             self.right_conn.send({"cmd": "plan_grippers", "now_val": now_val, "target_val": target_val})
             return self.right_conn.recv()
