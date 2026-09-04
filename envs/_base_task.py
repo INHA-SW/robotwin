@@ -433,7 +433,8 @@ class Base_Task(gym.Env):
         """
         if not hasattr(self, "robot"):
             self.robot = Robot(self.scene, self.need_topp, **kwags)
-            self.robot.set_planner(self.scene)
+            if self.need_plan:
+                self.robot.set_planner(self.scene)
             self.robot.init_joints()
         else:
             self.robot.reset(self.scene, self.need_topp, **kwags)

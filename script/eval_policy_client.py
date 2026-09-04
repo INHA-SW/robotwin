@@ -381,6 +381,15 @@ def main(usr_args):
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
+    planner_disabled = _env_bool("ROBOTWIN_DISABLE_PLANNER", False)
+    if planner_disabled:
+        if not os.environ.get("ROBOTWIN_EPISODE_MANIFEST", "").strip():
+            raise RuntimeError(
+                "ROBOTWIN_DISABLE_PLANNER requires a fixed ROBOTWIN_EPISODE_MANIFEST; "
+                "expert seed selection cannot run without a planner."
+            )
+        args["need_plan"] = False
+
     args["eval_video_log"] = _env_bool("ROBOTWIN_EVAL_VIDEO_LOG", args.get("eval_video_log", False))
     args["render_freq"] = _env_int("ROBOTWIN_RENDER_FREQ", args.get("render_freq", 0))
     args["clear_cache_freq"] = _env_int("ROBOTWIN_CLEAR_CACHE_FREQ", args.get("clear_cache_freq", 5))
