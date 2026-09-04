@@ -18,8 +18,14 @@ LABEL org.opencontainers.image.revision="${ARM_ROOT_REVISION}" \
 
 WORKDIR /app
 
-# Needed because LeRobot uses git-lfs.
-RUN apt-get update && apt-get install -y git git-lfs
+# LeRobot uses git-lfs. The locked Linux dependency set also includes evdev,
+# which compiles its extension against the kernel input headers.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    git-lfs \
+    linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy from the cache instead of linking since it's a mounted volume
 ENV UV_LINK_MODE=copy
