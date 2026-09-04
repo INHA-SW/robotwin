@@ -19,12 +19,16 @@ LABEL org.opencontainers.image.revision="${ARM_ROOT_REVISION}" \
 WORKDIR /app
 
 # LeRobot uses git-lfs. The locked Linux dependency set also includes evdev,
-# which compiles its extension against the kernel input headers.
+# which compiles its extension against the kernel input headers. pi_model imports
+# OpenCV at startup, so keep its Linux loader dependencies in the image instead
+# of adding them interactively on individual hosts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     clang \
     git \
     git-lfs \
+    libgl1 \
+    libglib2.0-0 \
     linux-libc-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -50,6 +54,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN uv pip install --python $UV_PROJECT_ENVIRONMENT/bin/python --no-cache \
     "pytest==8.3.4" \
     "transformers==4.53.2"
+
+# The lockfile currently resolves torch 2.6, which cannot execute on Blackwell
+# (sm_120). Use one CUDA 12.8 PyTorch runtime on both Ada/Home and Blackwell
+# hosts so cross-host parity is not confounded by different torch builds.
+RUN uv pip install --python $UV_PROJECT_ENVIRONMENT/bin/python --no-cache \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    "torch==2.11.0" \
+    "torchvision==0.26.0"
 COPY src/openpi/models_pytorch/transformers_replace/ /tmp/transformers_replace/
 RUN transformers_dir="$($UV_PROJECT_ENVIRONMENT/bin/python -c \
       'import pathlib, transformers; print(pathlib.Path(transformers.__file__).parent)')" \
